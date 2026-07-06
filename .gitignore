@@ -18,3 +18,4 @@ env/
 .idea/
 Thumbs.db
 Desktop.ini
+.env

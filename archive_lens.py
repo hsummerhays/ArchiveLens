@@ -23,8 +23,28 @@ if hasattr(sys.stderr, 'reconfigure'):
 
 console = Console()
 
+def load_env():
+
+    """Loads environment variables from a local .env file if it exists."""
+    dotenv_path = os.path.join(os.path.dirname(__file__), ".env")
+    if os.path.exists(dotenv_path):
+        try:
+            with open(dotenv_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" in line:
+                        key, val = line.split("=", 1)
+                        os.environ[key.strip()] = val.strip().strip("'\"")
+        except Exception as e:
+            console.print(f"[yellow]Warning: Could not read .env file: {str(e)}[/yellow]")
+
+load_env()
+
 # Load configuration
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
+
 try:
     with open(CONFIG_PATH, "r") as f:
         config = json.load(f)
