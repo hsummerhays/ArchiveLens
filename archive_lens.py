@@ -74,6 +74,7 @@ def init_db():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS emails (
             entry_id TEXT PRIMARY KEY,
+            message_id TEXT,
             subject TEXT,
             sender_name TEXT,
             sender_email TEXT,
@@ -87,8 +88,26 @@ def init_db():
             has_attachments INTEGER
         )
     """)
+    # Add message_id if missing in legacy databases
+    try:
+        cursor.execute("ALTER TABLE emails ADD COLUMN message_id TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS documents (
+            file_path TEXT PRIMARY KEY,
+            file_name TEXT,
+            file_type TEXT,
+            file_size INTEGER,
+            modified_time TEXT,
+            body TEXT
+        )
+    """)
     conn.commit()
     conn.close()
+
 
 
 def call_claude(system_prompt, user_prompt):
@@ -96,7 +115,7 @@ def call_claude(system_prompt, user_prompt):
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         console.print("[red]Error: ANTHROPIC_API_KEY environment variable is not set.[/red]")
-        console.print("Please set it in your environment: [bold]set ANTHROPIC_API_KEY=your_key_here[/bold]")
+        console.print("Please set it in your environment or local .env file.")
         sys.exit(1)
 
     url = "https://api.anthropic.com/v1/messages"
@@ -170,7 +189,7 @@ def clean_body(body_text):
     # Truncate if it exceeds limit
     limit = config.get("max_body_char_limit", 100000)
     if len(body_text) > limit:
-        body_text = body_text[:limit] + "\n\n[TRUNCATED DUE TO SIZE]"
+        body_text = body_text[:limit] + "\n\n[TRUNCATED]"
     return body_text
 
 
@@ -195,6 +214,142 @@ def parse_recipients(recipients_obj):
     return ", ".join(recipients)
 
 
+def extract_text_from_file(filepath):
+    """Gracefully extracts text from various document formats."""
+    ext = os.path.splitext(filepath)[1].lower()
+    text_extensions = {
+        '.txt', '.md', '.markdown', '.py', '.js', '.json', '.csv', '.cs', '.html', '.css', 
+        '.ini', '.cfg', '.xml', '.yml', '.yaml', '.sql', '.sh', '.bat', '.ps1'
+    }
+    if ext in text_extensions:
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
+        except Exception:
+            return None
+    elif ext == '.pdf':
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(filepath)
+            text = []
+            for page in reader.pages:
+                text.append(page.extract_text() or "")
+            return "\n".join(text)
+        except ImportError:
+            return None
+        except Exception:
+            return None
+    elif ext == '.docx':
+        try:
+            import docx
+            doc = docx.Document(filepath)
+            return "\n".join([p.text for p in doc.paragraphs])
+        except ImportError:
+            return None
+        except Exception:
+            return None
+    return None
+
+
+def index_folder(folder_path):
+    """Indexes non-PST files in the specified folder recursively."""
+    if not os.path.exists(folder_path):
+        console.print(f"[red]Error: Folder not found at '{folder_path}'[/red]")
+        sys.exit(1)
+        
+    init_db()
+    
+    ignored_dir_names = {".git", "__pycache__", ".venv", "venv", ".idea", ".vscode", "node_modules"}
+    allowed_extensions = {
+        # Text/code formats
+        '.txt', '.md', '.markdown', '.py', '.js', '.json', '.csv', '.cs', '.html', '.css', 
+        '.ini', '.cfg', '.xml', '.yml', '.yaml', '.sql', '.sh', '.bat', '.ps1',
+        # Rich formats
+        '.pdf', '.docx'
+    }
+    
+    files_to_index = []
+    for root, dirs, files in os.walk(folder_path):
+        dirs[:] = [d for d in dirs if d not in ignored_dir_names]
+        for file in files:
+            ext = os.path.splitext(file)[1].lower()
+            if ext == '.pst':
+                continue
+            if ext in allowed_extensions:
+                files_to_index.append(os.path.join(root, file))
+                
+    if not files_to_index:
+        console.print("[yellow]No indexable documents found in the specified folder.[/yellow]")
+        return
+        
+    console.print(f"[cyan]Found {len(files_to_index)} candidate files to index.[/cyan]")
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    docs_indexed = 0
+    docs_skipped = 0
+    
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        console=console
+    ) as progress:
+        task = progress.add_task("Indexing folder...", total=len(files_to_index))
+        for filepath in files_to_index:
+            progress.update(task, advance=1, description=f"Scanning {os.path.basename(filepath)}")
+            try:
+                stat = os.stat(filepath)
+                file_size = stat.st_size
+                mtime_str = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                
+                # Check if unmodified
+                cursor.execute(
+                    "SELECT modified_time, file_size FROM documents WHERE file_path = ?", 
+                    (filepath,)
+                )
+                row = cursor.fetchone()
+                if row and row["modified_time"] == mtime_str and row["file_size"] == file_size:
+                    docs_skipped += 1
+                    continue
+                    
+                text = extract_text_from_file(filepath)
+                if text is None:
+                    docs_skipped += 1
+                    continue
+                
+                text = clean_body(text)
+                file_name = os.path.basename(filepath)
+                file_type = os.path.splitext(file_name)[1].lower()
+                
+                cursor.execute("""
+                    INSERT OR REPLACE INTO documents (
+                        file_path, file_name, file_type, file_size, modified_time, body
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    filepath, file_name, file_type, file_size, mtime_str, text
+                ))
+                
+                docs_indexed += 1
+                if docs_indexed % 50 == 0:
+                    conn.commit()
+            except Exception:
+                pass
+                
+    conn.commit()
+    conn.close()
+    
+    console.print(Panel(
+        f"[green]Document indexing completed successfully![/green]\n\n"
+        f"• Files newly indexed/updated: [bold]{docs_indexed}[/bold]\n"
+        f"• Files skipped (unchanged/unreadable): [bold]{docs_skipped}[/bold]\n"
+        f"• Database file: [bold]{DB_PATH}[/bold]",
+        title="Success"
+    ))
+
+
 def index_pst(pst_path):
     """Indexes emails from a PST file into the SQLite database."""
     if not os.path.exists(pst_path):
@@ -203,7 +358,6 @@ def index_pst(pst_path):
         
     init_db()
     
-    # Import win32com client inside function to avoid import errors on non-Windows if imported elsewhere
     try:
         import win32com.client
         import pythoncom
@@ -235,15 +389,10 @@ def index_pst(pst_path):
         pst_root = find_pst_folder(outlook, abs_pst_path)
         if not pst_root:
             console.print("[red]Error: Added PST store could not be found in Outlook stores.[/red]")
-            # Try to list folders for debugging
-            console.print("Available folders:")
-            for folder in outlook.Folders:
-                console.print(f" - {folder.Name}")
             sys.exit(1)
             
         console.print(f"[green]Successfully loaded store: [bold]{pst_root.Name}[/bold][/green]")
         
-        # Traverse folders to collect tasks
         folders_to_process = []
         ignored_folders = set(config.get("ignored_folders", []))
         
@@ -259,7 +408,6 @@ def index_pst(pst_path):
                 collect_folders(subfolder, path)
                 
         collect_folders(pst_root)
-        
         console.print(f"[cyan]Found {len(folders_to_process)} folders to scan.[/cyan]")
         
         conn = get_db_connection()
@@ -275,7 +423,6 @@ def index_pst(pst_path):
                 if total_items == 0:
                     continue
                     
-                # Use a progress bar for each folder
                 with Progress(
                     SpinnerColumn(),
                     TextColumn("[progress.description]{task.description}"),
@@ -285,20 +432,16 @@ def index_pst(pst_path):
                 ) as progress:
                     task = progress.add_task(f"Scanning {folder_path}...", total=total_items)
                     
-                    # Sort items to get latest first or process in order
                     for i in range(1, total_items + 1):
                         progress.update(task, advance=1)
                         try:
                             item = items.Item(i)
-                            
-                            # Standard Outlook Message class is 43 (olMail)
-                            # But we also check attributes to be safe
                             if not hasattr(item, 'EntryID'):
                                 continue
                                 
                             entry_id = item.EntryID
                             
-                            # Check if already indexed
+                            # Check if already indexed by Entry ID
                             cursor.execute("SELECT 1 FROM emails WHERE entry_id = ?", (entry_id,))
                             if cursor.fetchone():
                                 emails_skipped += 1
@@ -314,8 +457,6 @@ def index_pst(pst_path):
                                 pass
                                 
                             to_recipients = ""
-                            cc_recipients = ""
-                            bcc_recipients = ""
                             try:
                                 to_recipients = parse_recipients(item.Recipients)
                             except Exception:
@@ -334,6 +475,31 @@ def index_pst(pst_path):
                                 except Exception:
                                     pass
                                     
+                            # Extract Message-ID for duplicate tracking
+                            message_id = ""
+                            try:
+                                message_id = item.PropertyAccessor.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x1035001F")
+                            except Exception:
+                                pass
+                                
+                            # Deduplication checks:
+                            if message_id:
+                                # Primary check: Message-ID
+                                cursor.execute("SELECT 1 FROM emails WHERE message_id = ?", (message_id,))
+                                if cursor.fetchone():
+                                    emails_skipped += 1
+                                    continue
+                            else:
+                                # Fallback check: Subject + Sender + Received Time (to catch drafts, internal, or calendar items)
+                                if subject and received_time:
+                                    cursor.execute(
+                                        "SELECT 1 FROM emails WHERE subject = ? AND sender_name = ? AND received_time = ?",
+                                        (subject, sender_name, received_time)
+                                    )
+                                    if cursor.fetchone():
+                                        emails_skipped += 1
+                                        continue
+                                        
                             body = clean_body(getattr(item, "Body", ""))
                             importance = getattr(item, "Importance", 1)
                             
@@ -346,13 +512,13 @@ def index_pst(pst_path):
                                 
                             cursor.execute("""
                                 INSERT OR REPLACE INTO emails (
-                                    entry_id, subject, sender_name, sender_email,
+                                    entry_id, message_id, subject, sender_name, sender_email,
                                     to_recipients, cc_recipients, bcc_recipients,
                                     received_time, body, folder_path, importance, has_attachments
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """, (
-                                entry_id, subject, sender_name, sender_email,
-                                to_recipients, cc_recipients, bcc_recipients,
+                                entry_id, message_id, subject, sender_name, sender_email,
+                                to_recipients, "", "",
                                 received_time, body, folder_path, importance, has_attachments
                             ))
                             
@@ -360,13 +526,12 @@ def index_pst(pst_path):
                             if emails_indexed % 100 == 0:
                                 conn.commit()
                                 
-                        except Exception as e:
-                            # Skip single corrupted/unreadable emails
+                        except Exception:
                             pass
                             
                 conn.commit()
             except Exception as e:
-                console.print(f"[yellow]Skipping folder {folder_path} due to error: {str(e)}[/yellow]")
+                console.print(f"[yellow]Skipping folder {folder_path}: {str(e)}[/yellow]")
                 
         conn.commit()
         conn.close()
@@ -374,7 +539,7 @@ def index_pst(pst_path):
         console.print(Panel(
             f"[green]Indexing completed successfully![/green]\n\n"
             f"• Emails newly indexed: [bold]{emails_indexed}[/bold]\n"
-            f"• Emails skipped (already indexed): [bold]{emails_skipped}[/bold]\n"
+            f"• Emails skipped: [bold]{emails_skipped}[/bold]\n"
             f"• Database file: [bold]{DB_PATH}[/bold]",
             title="Success"
         ))
@@ -392,47 +557,62 @@ def index_pst(pst_path):
 def show_stats():
     """Displays indexing statistics."""
     if not os.path.exists(DB_PATH):
-        console.print(f"[red]Database not found at '{DB_PATH}'. Run 'index' first.[/red]")
+        console.print(f"[red]Database not found at '{DB_PATH}'. Run 'index' or 'index-folder' first.[/red]")
         return
         
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    cursor.execute("SELECT COUNT(*) FROM emails")
-    total_emails = cursor.fetchone()[0]
+    # Check if tables exist
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='emails'")
+    has_emails = cursor.fetchone() is not None
     
-    cursor.execute("SELECT COUNT(DISTINCT folder_path) FROM emails")
-    total_folders = cursor.fetchone()[0]
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='documents'")
+    has_documents = cursor.fetchone() is not None
     
-    cursor.execute("SELECT folder_path, COUNT(*) as cnt FROM emails GROUP BY folder_path ORDER BY cnt DESC")
-    folders = cursor.fetchall()
+    total_emails = 0
+    total_folders = 0
+    min_date, max_date = "N/A", "N/A"
     
-    cursor.execute("SELECT MIN(received_time), MAX(received_time) FROM emails WHERE received_time IS NOT NULL AND received_time != ''")
-    min_date, max_date = cursor.fetchone()
-    
+    if has_emails:
+        cursor.execute("SELECT COUNT(*) FROM emails")
+        total_emails = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(DISTINCT folder_path) FROM emails")
+        total_folders = cursor.fetchone()[0]
+        cursor.execute("SELECT MIN(received_time), MAX(received_time) FROM emails WHERE received_time IS NOT NULL AND received_time != ''")
+        min_date, max_date = cursor.fetchone()
+        
+    total_docs = 0
+    doc_types = []
+    if has_documents:
+        cursor.execute("SELECT COUNT(*) FROM documents")
+        total_docs = cursor.fetchone()[0]
+        cursor.execute("SELECT file_type, COUNT(*) as cnt FROM documents GROUP BY file_type ORDER BY cnt DESC")
+        doc_types = cursor.fetchall()
+        
     conn.close()
     
-    console.print(Panel(
+    email_stats_text = (
         f"• Total Indexed Emails: [bold cyan]{total_emails}[/bold cyan]\n"
-        f"• Folders: [bold cyan]{total_folders}[/bold cyan]\n"
-        f"• Date Range: [bold]{min_date} to {max_date}[/bold]\n"
+        f"• Email Folders: [bold cyan]{total_folders}[/bold cyan]\n"
+        f"• Email Date Range: [bold]{min_date or 'N/A'} to {max_date or 'N/A'}[/bold]"
+    )
+    
+    doc_stats_text = (
+        f"• Total Indexed Documents: [bold cyan]{total_docs}[/bold cyan]\n"
+        f"• Document Types: [bold]{', '.join([f'{r[0]} ({r[1]})' for r in doc_types]) or 'None'}[/bold]"
+    )
+    
+    console.print(Panel(
+        f"[bold underline]Email Archive Stats[/bold underline]\n{email_stats_text}\n\n"
+        f"[bold underline]Document Folder Stats[/bold underline]\n{doc_stats_text}\n\n"
         f"• Database Path: [bold]{DB_PATH}[/bold]",
         title="ArchiveLens Database Stats"
     ))
-    
-    if folders:
-        table = Table(title="Emails per Folder")
-        table.add_column("Folder Path", style="cyan")
-        table.add_column("Email Count", justify="right", style="green")
-        for f in folders[:15]:
-            table.add_row(f["folder_path"], str(f["cnt"]))
-        if len(folders) > 15:
-            table.add_row("...", f"+{len(folders)-15} more folders")
-        console.print(table)
 
 
 def run_search(query, limit=20, folder=None):
-    """Searches the database for a keyword query."""
+    """Searches the database for a keyword query across emails and documents."""
     if not os.path.exists(DB_PATH):
         console.print(f"[red]Database not found at '{DB_PATH}'. Run 'index' first.[/red]")
         return
@@ -440,53 +620,80 @@ def run_search(query, limit=20, folder=None):
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    sql = "SELECT subject, sender_name, received_time, folder_path, has_attachments FROM emails WHERE 1=1"
-    params = []
+    # Check what tables are populated
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='emails'")
+    has_emails = cursor.fetchone() is not None
     
-    if query:
-        # Simple case-insensitive search
-        sql += " AND (subject LIKE ? OR body LIKE ? OR sender_name LIKE ? OR sender_email LIKE ?)"
-        term = f"%{query}%"
-        params.extend([term, term, term, term])
-        
-    if folder:
-        sql += " AND folder_path LIKE ?"
-        params.append(f"%{folder}%")
-        
-    sql += " ORDER BY received_time DESC LIMIT ?"
-    params.append(limit)
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='documents'")
+    has_documents = cursor.fetchone() is not None
     
-    cursor.execute(sql, params)
-    rows = cursor.fetchall()
+    email_rows = []
+    if has_emails:
+        email_sql = "SELECT subject, sender_name, received_time, folder_path, has_attachments FROM emails WHERE 1=1"
+        email_params = []
+        if query:
+            email_sql += " AND (subject LIKE ? OR body LIKE ? OR sender_name LIKE ? OR sender_email LIKE ?)"
+            term = f"%{query}%"
+            email_params.extend([term, term, term, term])
+        if folder:
+            email_sql += " AND folder_path LIKE ?"
+            email_params.append(f"%{folder}%")
+        email_sql += " ORDER BY received_time DESC LIMIT ?"
+        email_params.append(limit)
+        cursor.execute(email_sql, email_params)
+        email_rows = cursor.fetchall()
+        
+    doc_rows = []
+    if has_documents:
+        doc_sql = "SELECT file_name, file_path, file_type, file_size, modified_time FROM documents WHERE 1=1"
+        doc_params = []
+        if query:
+            doc_sql += " AND (file_name LIKE ? OR body LIKE ?)"
+            term = f"%{query}%"
+            doc_params.extend([term, term])
+        doc_sql += " ORDER BY modified_time DESC LIMIT ?"
+        doc_params.append(limit)
+        cursor.execute(doc_sql, doc_params)
+        doc_rows = cursor.fetchall()
+        
     conn.close()
     
-    if not rows:
-        console.print(f"[yellow]No results found matching '{query}'.[/yellow]")
+    if not email_rows and not doc_rows:
+        console.print(f"[yellow]No emails or documents found matching '{query}'.[/yellow]")
         return
         
-    table = Table(title=f"Search Results for '{query}' (showing top {len(rows)})")
-    table.add_column("Date", style="magenta", width=19)
-    table.add_column("Sender", style="cyan", max_width=25)
-    table.add_column("Subject", style="green", max_width=60)
-    table.add_column("Folder", style="blue")
-    table.add_column("Att.", justify="center", style="yellow")
-    
-    for row in rows:
-        att = "📎" if row["has_attachments"] else ""
-        # Highlight query matches in subject
-        subj = row["subject"] or "(No Subject)"
-        if query:
-            subj = re.sub(f"({re.escape(query)})", r"[bold yellow]\1[/bold yellow]", subj, flags=re.IGNORECASE)
-            
-        table.add_row(
-            row["received_time"] or "N/A",
-            row["sender_name"] or "N/A",
-            subj,
-            row["folder_path"],
-            att
-        )
+    if email_rows:
+        table = Table(title=f"Matching Emails for '{query}' (showing top {len(email_rows)})")
+        table.add_column("Date", style="magenta", width=19)
+        table.add_column("Sender", style="cyan", max_width=25)
+        table.add_column("Subject", style="green", max_width=60)
+        table.add_column("Folder", style="blue")
+        table.add_column("Att.", justify="center", style="yellow")
         
-    console.print(table)
+        for row in email_rows:
+            att = "📎" if row["has_attachments"] else ""
+            subj = row["subject"] or "(No Subject)"
+            if query:
+                subj = re.sub(f"({re.escape(query)})", r"[bold yellow]\1[/bold yellow]", subj, flags=re.IGNORECASE)
+            table.add_row(row["received_time"] or "N/A", row["sender_name"] or "N/A", subj, row["folder_path"], att)
+        console.print(table)
+        console.print()
+        
+    if doc_rows:
+        table = Table(title=f"Matching Documents for '{query}' (showing top {len(doc_rows)})")
+        table.add_column("Modified Time", style="magenta", width=19)
+        table.add_column("File Name", style="green", max_width=40)
+        table.add_column("Type", style="yellow")
+        table.add_column("Size (KB)", justify="right", style="cyan")
+        table.add_column("Path", style="blue", max_width=60)
+        
+        for row in doc_rows:
+            fname = row["file_name"]
+            if query:
+                fname = re.sub(f"({re.escape(query)})", r"[bold yellow]\1[/bold yellow]", fname, flags=re.IGNORECASE)
+            size_kb = round(row["file_size"] / 1024, 1) if row["file_size"] else 0
+            table.add_row(row["modified_time"] or "N/A", fname, row["file_type"] or "N/A", str(size_kb), row["file_path"])
+        console.print(table)
 
 
 def list_folders():
@@ -512,38 +719,45 @@ def list_folders():
 def run_ask(question):
     """Executes a natural language question using a RAG pipeline with Claude."""
     if not os.path.exists(DB_PATH):
-        console.print(f"[red]Database not found at '{DB_PATH}'. Run 'index' first.[/red]")
+        console.print(f"[red]Database not found at '{DB_PATH}'. Index something first.[/red]")
         return
 
-    # Step 1: Request Claude to generate the SQL query to fetch relevant emails
-    sql_generation_system_prompt = """You are an expert SQL assistant for ArchiveLens, an email analysis tool.
-Your job is to generate a read-only SQLite SELECT query that finds the emails needed to answer the user's natural language question.
+    # Step 1: Request Claude to generate the SQL query to fetch relevant data
+    sql_generation_system_prompt = """You are an expert SQL assistant for ArchiveLens, an intelligence tool.
+Your job is to generate a read-only SQLite SELECT query that finds the data needed to answer the user's natural language question.
 Do NOT output any explanations or conversational text. Output ONLY a valid JSON object matching this schema:
 {
   "reasoning": "A short sentence explaining what we are searching for.",
   "sql_query": "The sqlite SELECT query."
 }
 
-Database Schema for the `emails` table:
-- entry_id (TEXT): Primary key
-- subject (TEXT): Subject of the email
-- sender_name (TEXT): Display name of the sender
-- sender_email (TEXT): Email address of the sender
-- to_recipients (TEXT): Recipients in 'To' field
-- cc_recipients (TEXT): Recipients in 'CC' field
-- bcc_recipients (TEXT): Recipients in 'BCC' field
-- received_time (TEXT): Timestamp formatted as 'YYYY-MM-DD HH:MM:SS'
-- body (TEXT): Cleaned body text of the email
-- folder_path (TEXT): Folder path in the PST structure
-- importance (INTEGER): Importance flag
-- has_attachments (INTEGER): 1 if attachments are present, 0 otherwise
+Database Schema:
+1. Table `emails`:
+   - entry_id (TEXT): Primary key
+   - subject (TEXT): Subject of the email
+   - sender_name (TEXT): Display name of the sender
+   - sender_email (TEXT): Email address of the sender
+   - to_recipients (TEXT): Recipients in 'To' field
+   - received_time (TEXT): Timestamp formatted as 'YYYY-MM-DD HH:MM:SS'
+   - body (TEXT): Cleaned body text of the email
+   - folder_path (TEXT): Folder path in the PST structure
+   - importance (INTEGER): Importance flag
+   - has_attachments (INTEGER): 1 if attachments are present, 0 otherwise
+
+2. Table `documents`:
+   - file_path (TEXT): Absolute file path (primary key)
+   - file_name (TEXT): File name
+   - file_type (TEXT): Extension of the file (e.g. '.pdf', '.txt')
+   - file_size (INTEGER): File size in bytes
+   - modified_time (TEXT): Timestamp formatted as 'YYYY-MM-DD HH:MM:SS'
+   - body (TEXT): Extracted text content of the document
 
 Rules:
-1. ONLY return columns like: `subject`, `sender_name`, `received_time`, `body`, `folder_path`. Do not select `entry_id` unless necessary.
+1. ONLY return select queries. Do not select `entry_id` or other identifiers unless necessary.
 2. Use CASE-INSENSITIVE filters like `LIKE '%query%'` for text matches.
-3. Order search results by `received_time DESC`.
-4. Limit the query results to a maximum of 50 records to fit the LLM context window.
-5. Generate a SQLite compatible query.
+3. Order search results by chronological order (e.g., `received_time DESC` or `modified_time DESC`).
+4. Limit the query results to a maximum of 50 records.
+5. Generate a SQLite compatible query. You can query from `emails`, `documents`, or union results if appropriate.
 """
 
     console.print(f"[cyan]Analyzing question and generating database search query...[/cyan]")
@@ -551,9 +765,7 @@ Rules:
     
     response_text = call_claude(sql_generation_system_prompt, sql_generation_user_prompt)
     
-    # Parse the generated JSON response
     try:
-        # Strip any markdown code fence if Claude added it
         clean_response = response_text.strip()
         if clean_response.startswith("```json"):
             clean_response = clean_response[7:]
@@ -573,7 +785,7 @@ Rules:
     sql_query_upper = sql_query.upper()
     forbidden = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "REPLACE", "TRUNCATE"]
     if any(word in sql_query_upper for word in forbidden) or not sql_query_upper.strip().startswith("SELECT"):
-        console.print(f"[red]Safety violation: Generated query contains forbidden keywords or is not a SELECT query.[/red]")
+        console.print(f"[red]Safety violation: Generated query is invalid or unsafe.[/red]")
         console.print(f"Query: {sql_query}")
         return
 
@@ -592,49 +804,42 @@ Rules:
     conn.close()
     
     if not rows:
-        console.print("[yellow]No relevant emails were found in the database matching this search pattern.[/yellow]")
+        console.print("[yellow]No relevant data found in the database.[/yellow]")
         return
         
-    console.print(f"[green]Retrieved {len(rows)} emails. Synthesizing answer...[/green]")
+    console.print(f"[green]Retrieved {len(rows)} results. Synthesizing answer...[/green]")
     
-    # Format the retrieved emails as context for the second stage
-    context_emails = []
+    # Generic key-value formatting of returned rows
+    context_items = []
     for idx, row in enumerate(rows):
-        # Limit individual email bodies to avoid overflowing model context window
-        body = row["body"] or ""
-        if len(body) > 2000:
-            body = body[:2000] + "... [TRUNCATED]"
-            
-        email_str = (
-            f"Email #{idx+1}:\n"
-            f"Date: {row['received_time'] or 'N/A'}\n"
-            f"Sender: {row['sender_name'] or 'N/A'}\n"
-            f"Subject: {row['subject'] or '(No Subject)'}\n"
-            f"Folder: {row['folder_path'] or 'N/A'}\n"
-            f"Body:\n{body}\n"
-            f"----------------------------------------"
-        )
-        context_emails.append(email_str)
+        row_str = f"Result #{idx+1}:\n"
+        for key in row.keys():
+            val = row[key]
+            if key == "body" and val and len(val) > 2000:
+                val = val[:2000] + "... [TRUNCATED]"
+            row_str += f"{key}: {val}\n"
+        row_str += "----------------------------------------"
+        context_items.append(row_str)
         
-    emails_context = "\n".join(context_emails)
+    context_str = "\n".join(context_items)
     
-    answer_system_prompt = """You are an advanced email search and extraction assistant.
-Your goal is to answer the user's natural language question based strictly and thoroughly on the provided email search results.
-Synthesize the information, reference dates, senders, and details accurately.
+    answer_system_prompt = """You are an advanced search and intelligence assistant.
+Your goal is to answer the user's natural language question based strictly and thoroughly on the provided database results.
+Synthesize the information, reference dates, files, paths, and details accurately.
 Formatting: Use beautiful GitHub-flavored markdown with clean lists, headers, and bullet points. Bold important words.
 """
 
-    answer_user_prompt = f"""Below are the search results from the email archive database.
-Use these emails to answer the user's question.
+    answer_user_prompt = f"""Below are the search results from the local intelligence database.
+Use these records to answer the user's question.
 
 User Question: "{question}"
 
 Search Results Context:
 ----------------------------------------
-{emails_context}
+{context_str}
 ----------------------------------------
 
-Please provide a structured, detailed answer to the user's question based on the emails above.
+Please provide a structured, detailed answer to the user's question based on the records above.
 """
 
     with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
@@ -647,14 +852,18 @@ Please provide a structured, detailed answer to the user's question based on the
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ArchiveLens: Lightweight Email PST Ingestion & Intelligent Analysis Tool",
+        description="ArchiveLens: Local-First Email & Document Intelligence Platform",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
     
-    # Ingestion command
+    # Ingestion command (PST)
     parser_index = subparsers.add_parser("index", help="Index emails from a PST file")
     parser_index.add_argument("pst_path", help="Path to the Outlook PST file")
+    
+    # Ingestion command (Folder of documents)
+    parser_index_folder = subparsers.add_parser("index-folder", help="Index all non-pst documents recursively from a folder")
+    parser_index_folder.add_argument("folder_path", help="Path to the folder containing documents")
     
     # Stats command
     subparsers.add_parser("stats", help="Show database size and indexing stats")
@@ -663,19 +872,21 @@ def main():
     subparsers.add_parser("folders", help="List all indexed email folders")
     
     # Search command
-    parser_search = subparsers.add_parser("search", help="Perform keyword search on indexed emails")
+    parser_search = subparsers.add_parser("search", help="Perform keyword search on indexed emails and documents")
     parser_search.add_argument("query", help="Keyword or phrase to search for")
     parser_search.add_argument("--limit", type=int, default=20, help="Max results to display")
-    parser_search.add_argument("--folder", help="Filter by folder path pattern")
+    parser_search.add_argument("--folder", help="Filter by email folder path pattern")
     
     # Ask command (LLM)
-    parser_ask = subparsers.add_parser("ask", help="Ask a natural language question about the archive (requires ANTHROPIC_API_KEY)")
-    parser_ask.add_argument("question", help="Question to ask (e.g. 'Summarize everything I did for Conde Nast.')")
+    parser_ask = subparsers.add_parser("ask", help="Ask a natural language question about emails and documents (requires ANTHROPIC_API_KEY)")
+    parser_ask.add_argument("question", help="Question to ask (e.g. 'Summarize what I did for Conde Nast.')")
     
     args = parser.parse_args()
     
     if args.command == "index":
         index_pst(args.pst_path)
+    elif args.command == "index-folder":
+        index_folder(args.folder_path)
     elif args.command == "stats":
         show_stats()
     elif args.command == "folders":
