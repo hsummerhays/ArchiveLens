@@ -128,8 +128,20 @@ You can customize ArchiveLens behavior in `config.json`:
 ArchiveLens establishes a robust, local ingestion and analysis workflow:
 
 ```
-Outlook PST ──> MAPI ──> Traverse Folders ──> Extract Messages ──> Normalize ──> SQLite Index ──> Future Search / AI
+Outlook PST ──> MAPI ────┐
+                         ├──> Extract & Normalize ──> SQLite Index ──> Unified Data Pipeline (ArchiveLens)
+Doc Folders  ──> Parsers ─┘                                                     │
+                                                                                ├──> RootNode (Understand & Create)
+                                                                                ├──> AI Assistant (Query & Chat)
+                                                                                ├──> Timeline Viewer / DailyNotes
+                                                                                └──> Custom Search / Future UIs
 ```
+
+### Decoupled Architecture
+ArchiveLens is designed to serve as the **universal ingestion pipeline** for your entire engineering history. By normalizing Outlook PST archives, file systems, markdown files, and other inputs into a central, structured database:
+- **RootNode** consumes this database to organize chats and generate hierarchical summaries/knowledge trees.
+- **AI Assistants** and **Search UIs** query the index directly for semantic retrieval and RAG.
+- **Timeline Viewers** and **DailyNotes** utilize the chronological index to present activity graphs.
 
 ### Immediate Wins
 - **Full-Text Search**: Query nearly three decades of email locally and quickly.
