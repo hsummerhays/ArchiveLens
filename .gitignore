@@ -1,0 +1,20 @@
+# Database files
+*.db
+*.db-journal
+*.db-wal
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+ENV/
+env/
+
+# IDE / System
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

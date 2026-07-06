@@ -1,0 +1,17 @@
+{
+  "database_path": "archive.db",
+  "ignored_folders": [
+    "Junk Email",
+    "Deleted Items",
+    "Conversation History",
+    "Sync Issues",
+    "Conflicts",
+    "Local Failures",
+    "Server Failures",
+    "Drafts",
+    "Outbox"
+  ],
+  "max_body_char_limit": 100000,
+  "default_claude_model": "claude-3-5-sonnet-20241022",
+  "max_search_results_for_llm": 100
+}
