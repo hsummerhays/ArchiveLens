@@ -79,8 +79,28 @@ To filter by an Outlook email folder or limit results:
 python archive_lens.py search "Power BI" --limit 10 --folder "Sent Items"
 ```
 
-### 6. Natural Language Questions (RAG)
-You can ask complex questions directly. ArchiveLens will draft a SQLite query targeting emails, documents, or both, retrieve matching records, and synthesize a polished response via Claude:
+### 6. Generate Vector Embeddings
+To generate semantic vector embeddings for all indexed emails and documents (required for semantic search and semantic RAG):
+```bash
+# Default: Uses local fastembed ONNX CPU model (requires 'pip install fastembed')
+python archive_lens.py embed
+
+# Option: Uses OpenAI API (requires OPENAI_API_KEY set in .env)
+python archive_lens.py embed --provider openai
+```
+
+### 7. Semantic Vector Search
+To search your archives semantically based on conceptual similarity (rather than keyword matches):
+```bash
+python archive_lens.py search-semantic "Macola pricing bugs"
+python archive_lens.py search-semantic "compliments from management" --limit 5
+```
+
+### 8. Natural Language Questions (RAG)
+You can ask complex questions directly. ArchiveLens will dynamically synthesize answers based on your query:
+- **Semantic RAG (Embeddings present)**: If you've run the `embed` command, ArchiveLens automatically performs a vector similarity search to retrieve the top 20 most semantically relevant text chunks as context for Claude.
+- **SQL RAG (No embeddings)**: Falls back to using Claude to generate a safe SQL `SELECT` query to filter the database.
+
 ```bash
 python archive_lens.py ask "Show me every email related to Conde Nast."
 python archive_lens.py ask "Find all discussions about Power BI."
@@ -88,6 +108,7 @@ python archive_lens.py ask "Summarize everything I did for Reuters."
 python archive_lens.py ask "List every compliment I received from management."
 python archive_lens.py ask "Extract every architecture discussion involving MediaSphere."
 ```
+
 
 
 ---

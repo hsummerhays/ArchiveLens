@@ -105,8 +105,301 @@ def init_db():
             body TEXT
         )
     """)
+    
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS embeddings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id TEXT,
+            item_type TEXT,
+            chunk_index INTEGER,
+            chunk_text TEXT,
+            embedding BLOB
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_embeddings_item ON embeddings(item_id)")
+    
     conn.commit()
     conn.close()
+
+
+import struct
+
+def vector_to_blob(vector):
+    """Converts a float list vector to a binary BLOB."""
+    return struct.pack(f"{len(vector)}f", *vector)
+
+
+def blob_to_vector(blob):
+    """Converts a binary BLOB to a float list vector."""
+    dim = len(blob) // 4
+    return list(struct.unpack(f"{dim}f", blob))
+
+
+def cosine_similarity(v1, v2):
+    """Calculates cosine similarity between two float vectors using pure Python/math."""
+    dot_product = sum(x * y for x, y in zip(v1, v2))
+    norm_v1 = sum(x * x for x in v1) ** 0.5
+    norm_v2 = sum(x * x for x in v2) ** 0.5
+    if norm_v1 == 0 or norm_v2 == 0:
+        return 0.0
+    return dot_product / (norm_v1 * norm_v2)
+
+
+def chunk_text(text, chunk_size=800, overlap=100):
+    """Splits text into chunks of clean characters with some overlap."""
+    if not text:
+        return []
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        if end >= len(text):
+            break
+        start += chunk_size - overlap
+    return chunks
+
+
+# Lazy loader for local model
+_local_model = None
+
+def get_embeddings(texts, provider="local"):
+    """Fetches embeddings for a list of texts using local fastembed or OpenAI API."""
+    if provider == "local":
+        global _local_model
+        try:
+            from fastembed import TextEmbedding
+        except ImportError:
+            console.print("[red]Error: fastembed library is not installed for local embeddings.[/red]")
+            console.print("Please install it: [bold]pip install fastembed[/bold]")
+            sys.exit(1)
+            
+        if _local_model is None:
+            with console.status("[cyan]Loading local fastembed model...[/cyan]"):
+                _local_model = TextEmbedding()
+                
+        embeddings_gen = _local_model.embed(texts)
+        return [arr.tolist() for arr in embeddings_gen]
+        
+    elif provider == "openai":
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            console.print("[red]Error: OPENAI_API_KEY environment variable is not set.[/red]")
+            console.print("Please set it in your environment or local .env file.")
+            sys.exit(1)
+            
+        embeddings = []
+        for text in texts:
+            text_cleaned = text.replace("\n", " ")
+            url = "https://api.openai.com/v1/embeddings"
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
+            data = {
+                "model": "text-embedding-3-small",
+                "input": text_cleaned
+            }
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(data).encode("utf-8"),
+                headers=headers,
+                method="POST"
+            )
+            try:
+                with urllib.request.urlopen(req) as response:
+                    res = json.loads(response.read().decode("utf-8"))
+                    embeddings.append(res["data"][0]["embedding"])
+            except Exception as e:
+                console.print(f"[red]OpenAI Embedding API error: {str(e)}[/red]")
+                sys.exit(1)
+        return embeddings
+    else:
+        console.print(f"[red]Error: Unknown embedding provider '{provider}'[/red]")
+        sys.exit(1)
+
+
+def build_embeddings(provider="local"):
+    """Generates and saves embeddings for all unindexed emails and documents."""
+    init_db()
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT entry_id, subject, body FROM emails 
+        WHERE entry_id NOT IN (SELECT DISTINCT item_id FROM embeddings WHERE item_type = 'email')
+    """)
+    unindexed_emails = cursor.fetchall()
+    
+    cursor.execute("""
+        SELECT file_path, file_name, body FROM documents 
+        WHERE file_path NOT IN (SELECT DISTINCT item_id FROM embeddings WHERE item_type = 'document')
+    """)
+    unindexed_docs = cursor.fetchall()
+    
+    total_unindexed = len(unindexed_emails) + len(unindexed_docs)
+    if total_unindexed == 0:
+        console.print("[green]All emails and documents are already embedded![/green]")
+        conn.close()
+        return
+        
+    console.print(f"[cyan]Found {len(unindexed_emails)} emails and {len(unindexed_docs)} documents needing embeddings.[/cyan]")
+    
+    batch_items = []
+    
+    for row in unindexed_emails:
+        item_id = row["entry_id"]
+        subject = row["subject"] or ""
+        body = row["body"] or ""
+        full_text = f"Subject: {subject}\n\n{body}"
+        chunks = chunk_text(full_text)
+        for idx, chunk in enumerate(chunks):
+            batch_items.append({
+                "item_id": item_id,
+                "item_type": "email",
+                "chunk_index": idx,
+                "chunk_text": chunk
+            })
+            
+    for row in unindexed_docs:
+        item_id = row["file_path"]
+        file_name = row["file_name"] or ""
+        body = row["body"] or ""
+        full_text = f"Document: {file_name}\n\n{body}"
+        chunks = chunk_text(full_text)
+        for idx, chunk in enumerate(chunks):
+            batch_items.append({
+                "item_id": item_id,
+                "item_type": "document",
+                "chunk_index": idx,
+                "chunk_text": chunk
+            })
+            
+    if not batch_items:
+        console.print("[yellow]No text content available to embed.[/yellow]")
+        conn.close()
+        return
+        
+    console.print(f"[cyan]Generated {len(batch_items)} text chunks to embed. Processing batches...[/cyan]")
+    
+    batch_size = 32
+    chunks_indexed = 0
+    
+    get_embeddings(["test"], provider)
+    
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        console=console
+    ) as progress:
+        task = progress.add_task("Generating embeddings...", total=len(batch_items))
+        
+        for start_idx in range(0, len(batch_items), batch_size):
+            end_idx = min(start_idx + batch_size, len(batch_items))
+            sub_batch = batch_items[start_idx:end_idx]
+            
+            texts = [item["chunk_text"] for item in sub_batch]
+            try:
+                vectors = get_embeddings(texts, provider)
+                
+                for item, vector in zip(sub_batch, vectors):
+                    blob = vector_to_blob(vector)
+                    cursor.execute("""
+                        INSERT INTO embeddings (item_id, item_type, chunk_index, chunk_text, embedding)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (item["item_id"], item["item_type"], item["chunk_index"], item["chunk_text"], blob))
+                    
+                chunks_indexed += len(sub_batch)
+                progress.update(task, advance=len(sub_batch))
+                if chunks_indexed % 100 == 0:
+                    conn.commit()
+            except Exception as e:
+                console.print(f"\n[red]Batch processing failed: {str(e)}[/red]")
+                conn.commit()
+                conn.close()
+                sys.exit(1)
+                
+    conn.commit()
+    conn.close()
+    
+    console.print(Panel(
+        f"[green]Embeddings generated successfully![/green]\n\n"
+        f"• Text chunks embedded: [bold]{chunks_indexed}[/bold]\n"
+        f"• Provider used: [bold]{provider}[/bold]\n"
+        f"• Database file: [bold]{DB_PATH}[/bold]",
+        title="Success"
+    ))
+
+
+def run_semantic_search(query, limit=10, provider="local"):
+    """Performs semantic search on text chunks using cosine similarity."""
+    if not os.path.exists(DB_PATH):
+        console.print(f"[red]Database not found at '{DB_PATH}'. Index something first.[/red]")
+        return
+        
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='embeddings'")
+    if not cursor.fetchone():
+        console.print("[yellow]Embeddings table does not exist. Run 'embed' command first.[/yellow]")
+        conn.close()
+        return
+        
+    cursor.execute("SELECT COUNT(*) FROM embeddings")
+    total_embeddings = cursor.fetchone()[0]
+    if total_embeddings == 0:
+        console.print("[yellow]No embeddings found in the database. Run 'embed' command first.[/yellow]")
+        conn.close()
+        return
+        
+    console.print(f"[cyan]Generating embedding for query: '{query}'...[/cyan]")
+    query_vector = get_embeddings([query], provider)[0]
+    
+    console.print(f"[cyan]Calculating similarity across {total_embeddings} chunks...[/cyan]")
+    
+    cursor.execute("SELECT item_id, item_type, chunk_index, chunk_text, embedding FROM embeddings")
+    rows = cursor.fetchall()
+    
+    results = []
+    for row in rows:
+        db_vector = blob_to_vector(row["embedding"])
+        score = cosine_similarity(query_vector, db_vector)
+        results.append({
+            "item_id": row["item_id"],
+            "item_type": row["item_type"],
+            "chunk_index": row["chunk_index"],
+            "chunk_text": row["chunk_text"],
+            "score": score
+        })
+        
+    conn.close()
+    
+    results.sort(key=lambda x: x["score"], reverse=True)
+    top_results = results[:limit]
+    
+    table = Table(title=f"Semantic Search Results for '{query}' (showing top {len(top_results)})")
+    table.add_column("Score", justify="right", style="magenta", width=6)
+    table.add_column("Type", style="yellow", width=8)
+    table.add_column("Reference ID/Path", style="blue", max_width=45)
+    table.add_column("Snippet Preview", style="green", max_width=60)
+    
+    for r in top_results:
+        snippet = r["chunk_text"].replace("\n", " ")
+        if len(snippet) > 80:
+            snippet = snippet[:80] + "..."
+        table.add_row(
+            f"{r['score']:.3f}",
+            r["item_type"],
+            r["item_id"],
+            snippet
+        )
+        
+    console.print(table)
+
 
 
 
@@ -710,7 +1003,6 @@ def list_folders():
     cursor.execute("SELECT folder_path, COUNT(*) as cnt FROM emails GROUP BY folder_path ORDER BY folder_path")
     rows = cursor.fetchall()
     conn.close()
-    
     table = Table(title="Indexed Folders")
     table.add_column("Folder Path", style="cyan")
     table.add_column("Email Count", justify="right", style="green")
@@ -725,7 +1017,91 @@ def run_ask(question):
         console.print(f"[red]Database not found at '{DB_PATH}'. Index something first.[/red]")
         return
 
-    # Step 1: Request Claude to generate the SQL query to fetch relevant data
+    # Check if embeddings table has data
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='embeddings'")
+    has_embeddings_table = cursor.fetchone() is not None
+    
+    total_embeddings = 0
+    if has_embeddings_table:
+        cursor.execute("SELECT COUNT(*) FROM embeddings")
+        total_embeddings = cursor.fetchone()[0]
+    conn.close()
+    
+    if total_embeddings > 0:
+        # Step 1 (Semantic): Fetch embedding for query and compute cosine similarities
+        console.print(f"[cyan]Semantic index found with {total_embeddings} chunks. Performing vector RAG...[/cyan]")
+        provider = config.get("embedding_provider", "local")
+        
+        query_vector = get_embeddings([question], provider)[0]
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT item_id, item_type, chunk_index, chunk_text, embedding FROM embeddings")
+        rows = cursor.fetchall()
+        conn.close()
+        
+        results = []
+        for row in rows:
+            db_vector = blob_to_vector(row["embedding"])
+            score = cosine_similarity(query_vector, db_vector)
+            results.append({
+                "item_id": row["item_id"],
+                "item_type": row["item_type"],
+                "chunk_text": row["chunk_text"],
+                "score": score
+            })
+            
+        # Sort and take top 20 chunks as context
+        results.sort(key=lambda x: x["score"], reverse=True)
+        top_chunks = results[:20]
+        
+        console.print(f"[green]Retrieved top {len(top_chunks)} semantic chunks. Synthesizing answer...[/green]")
+        
+        context_items = []
+        for idx, r in enumerate(top_chunks):
+            chunk_str = (
+                f"Result #{idx+1} [Type: {r['item_type']}, ID/Path: {r['item_id']}, Similarity: {r['score']:.3f}]:\n"
+                f"{r['chunk_text']}\n"
+                f"----------------------------------------"
+            )
+            context_items.append(chunk_str)
+            
+        context_str = "\n".join(context_items)
+        
+        answer_system_prompt = """You are an advanced search and intelligence assistant.
+Your goal is to answer the user's natural language question based strictly and thoroughly on the provided database results.
+Synthesize the information, reference dates, files, paths, and details accurately.
+Formatting: Use beautiful GitHub-flavored markdown with clean lists, headers, and bullet points. Bold important words.
+"""
+
+        answer_user_prompt = f"""Below are the semantically retrieved search results from the local intelligence database.
+Use these records to answer the user's question.
+
+User Question: "{question}"
+
+Search Results Context:
+----------------------------------------
+{context_str}
+----------------------------------------
+
+Please provide a structured, detailed answer to the user's question based on the records above.
+"""
+
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
+            task = progress.add_task("Summarizing results...", total=None)
+            answer = call_claude(answer_system_prompt, answer_user_prompt)
+            
+        console.print()
+        console.print(Panel(Markdown(answer), title="ArchiveLens Answer (Semantic RAG)", border_style="green"))
+        return
+
+    # Fallback to SQL Generation RAG
+    console.print(f"[yellow]No semantic index found. Falling back to SQL Planner...[/yellow]")
+
+    # Request Claude to generate the SQL query to fetch relevant data
     sql_generation_system_prompt = """You are an expert SQL assistant for ArchiveLens, an intelligence tool.
 Your job is to generate a read-only SQLite SELECT query that finds the data needed to answer the user's natural language question.
 Do NOT output any explanations or conversational text. Output ONLY a valid JSON object matching this schema:
@@ -812,7 +1188,6 @@ Rules:
         
     console.print(f"[green]Retrieved {len(rows)} results. Synthesizing answer...[/green]")
     
-    # Generic key-value formatting of returned rows
     context_items = []
     for idx, row in enumerate(rows):
         row_str = f"Result #{idx+1}:\n"
@@ -850,7 +1225,7 @@ Please provide a structured, detailed answer to the user's question based on the
         answer = call_claude(answer_system_prompt, answer_user_prompt)
         
     console.print()
-    console.print(Panel(Markdown(answer), title="ArchiveLens Answer", border_style="green"))
+    console.print(Panel(Markdown(answer), title="ArchiveLens Answer (SQL RAG)", border_style="green"))
 
 
 def main():
@@ -868,17 +1243,27 @@ def main():
     parser_index_folder = subparsers.add_parser("index-folder", help="Index all non-pst documents recursively from a folder")
     parser_index_folder.add_argument("folder_path", help="Path to the folder containing documents")
     
+    # Embed command
+    parser_embed = subparsers.add_parser("embed", help="Generate vector embeddings for all indexed emails and documents")
+    parser_embed.add_argument("--provider", default="local", choices=["local", "openai"], help="Embedding provider to use (default: local)")
+    
     # Stats command
     subparsers.add_parser("stats", help="Show database size and indexing stats")
     
     # Folders command
     subparsers.add_parser("folders", help="List all indexed email folders")
     
-    # Search command
+    # Keyword search command
     parser_search = subparsers.add_parser("search", help="Perform keyword search on indexed emails and documents")
     parser_search.add_argument("query", help="Keyword or phrase to search for")
     parser_search.add_argument("--limit", type=int, default=20, help="Max results to display")
     parser_search.add_argument("--folder", help="Filter by email folder path pattern")
+    
+    # Semantic search command
+    parser_search_semantic = subparsers.add_parser("search-semantic", help="Perform vector similarity semantic search")
+    parser_search_semantic.add_argument("query", help="Query phrase to search semantically")
+    parser_search_semantic.add_argument("--limit", type=int, default=10, help="Max results to display")
+    parser_search_semantic.add_argument("--provider", default="local", choices=["local", "openai"], help="Embedding provider to use (default: local)")
     
     # Ask command (LLM)
     parser_ask = subparsers.add_parser("ask", help="Ask a natural language question about emails and documents (requires ANTHROPIC_API_KEY)")
@@ -890,12 +1275,16 @@ def main():
         index_pst(args.pst_path)
     elif args.command == "index-folder":
         index_folder(args.folder_path)
+    elif args.command == "embed":
+        build_embeddings(args.provider)
     elif args.command == "stats":
         show_stats()
     elif args.command == "folders":
         list_folders()
     elif args.command == "search":
         run_search(args.query, args.limit, args.folder)
+    elif args.command == "search-semantic":
+        run_semantic_search(args.query, args.limit, args.provider)
     elif args.command == "ask":
         run_ask(args.question)
     else:
