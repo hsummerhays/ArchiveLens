@@ -29,10 +29,15 @@ pip install -r requirements.txt
 ```
 
 ### 3. API Key Setup
-If you want to use the natural language questioning (`ask`) feature, you need to set the `ANTHROPIC_API_KEY` environment variable:
+If you want to use the natural language questioning (`ask`) feature, you can create a `.env` file in the project directory (copy `.env.example`) and add your key:
+```env
+ANTHROPIC_API_KEY=your_claude_api_key_here
+```
+Alternatively, you can set it as a system/session environment variable:
 ```cmd
 set ANTHROPIC_API_KEY=your_claude_api_key_here
 ```
+
 
 ---
 

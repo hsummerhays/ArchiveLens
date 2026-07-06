@@ -53,7 +53,7 @@ except Exception:
         "database_path": "archive.db",
         "ignored_folders": ["Junk Email", "Deleted Items", "Conversation History", "Sync Issues", "Conflicts", "Local Failures", "Server Failures", "Drafts", "Outbox"],
         "max_body_char_limit": 100000,
-        "default_claude_model": "claude-3-5-sonnet-20241022",
+        "default_claude_model": "claude-sonnet-5",
         "max_search_results_for_llm": 100
     }
 
@@ -126,7 +126,7 @@ def call_claude(system_prompt, user_prompt):
     }
     
     data = {
-        "model": config.get("default_claude_model", "claude-3-5-sonnet-20241022"),
+        "model": config.get("default_claude_model", "claude-sonnet-5"),
         "max_tokens": 4000,
         "system": system_prompt,
         "messages": [
@@ -299,7 +299,8 @@ def index_folder(folder_path):
     ) as progress:
         task = progress.add_task("Indexing folder...", total=len(files_to_index))
         for filepath in files_to_index:
-            progress.update(task, advance=1, description=f"Scanning {os.path.basename(filepath)}")
+            file_name = os.path.basename(filepath)
+            progress.update(task, advance=1, description=f"Scanning {file_name}")
             try:
                 stat = os.stat(filepath)
                 file_size = stat.st_size
@@ -312,16 +313,17 @@ def index_folder(folder_path):
                 )
                 row = cursor.fetchone()
                 if row and row["modified_time"] == mtime_str and row["file_size"] == file_size:
+                    progress.console.print(f"[yellow]Skipped (unchanged):[/yellow] {file_name}")
                     docs_skipped += 1
                     continue
                     
                 text = extract_text_from_file(filepath)
                 if text is None:
+                    progress.console.print(f"[red]Failed (could not extract text):[/red] {file_name}")
                     docs_skipped += 1
                     continue
                 
                 text = clean_body(text)
-                file_name = os.path.basename(filepath)
                 file_type = os.path.splitext(file_name)[1].lower()
                 
                 cursor.execute("""
@@ -332,11 +334,12 @@ def index_folder(folder_path):
                     filepath, file_name, file_type, file_size, mtime_str, text
                 ))
                 
+                progress.console.print(f"[green]Indexed:[/green] {file_name} ({round(file_size/1024, 1)} KB)")
                 docs_indexed += 1
                 if docs_indexed % 50 == 0:
                     conn.commit()
-            except Exception:
-                pass
+            except Exception as e:
+                progress.console.print(f"[red]Error indexing {file_name}:[/red] {str(e)}")
                 
     conn.commit()
     conn.close()
