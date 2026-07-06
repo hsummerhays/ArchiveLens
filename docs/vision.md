@@ -2,60 +2,56 @@
 
 This document outlines the long-term vision of how **DailyNotes**, **ArchiveLens**, and **RootNode** operate together as a cohesive personal knowledge management ecosystem.
 
+## The Verb Flow
+
+Rather than treating these as separate products, the ecosystem is built around a progressive pipeline of information processing:
+
 ```
-┌────────────────────────┐
-│ Capture: DailyNotes    │ <── Journal entries, active thoughts, and immediate logs
-└───────────┬────────────┘
-            │
-            ▼
-┌────────────────────────┐
-│ Ingest: ArchiveLens    │ <── Normalizes files, emails, code, logs, and CSVs into a SQLite DB
-└───────────┬────────────┘
-            │
-            ▼
-┌────────────────────────┐
-│ Understand: RootNode   │ <── Semantic search, topic nodes, summaries, and timeline relation
-└────────────────────────┘
+ Capture ──> Ingest ──> Understand ──> Recall ──> Create
 ```
+
+1. **Capture (DailyNotes)**: Actively logging daily journal entries, engineering tasks, meeting outcomes, and fresh ideas.
+2. **Ingest (ArchiveLens)**: Reading, extracting, and normalizing heterogeneous history (emails, source code, design specs, notes, spreadsheets) into a unified local SQLite datastore.
+3. **Understand (RootNode)**: Parsing, summarizing, relating, and mapping information into topic nodes and communication graphs.
+4. **Recall (Query & Search)**: Retrieving matching records via structured SQL search or semantic vector similarity.
+5. **Create (Synthesis & Generation)**: Generating architecture specs, project timelines, onboarding materials, and onboarding summaries directly from your historical engineering context.
 
 ---
 
-## Architectural Breakdown
+## Decoupled Architecture: Ingest as a Service
 
-### 1. Ingest: ArchiveLens 🔍
-* **Role**: Ingestion and normalization engine.
-* **Sources**: 
-  - Outlook PST / OST archives
-  - Local folders (PDFs, Word docs, code files, CSVs, txt, markdown)
-  - *Future sources*: Gmail, OneDrive, Git commits history, Slack/Teams exports, Notion, Jira.
-* **Output**: A unified, structured SQLite database (`archive.db`). 
-* **Design Philosophy**: Loose coupling. ArchiveLens handles the complexity of parsing raw, heterogeneous data formats so that downstream applications do not have to.
+A key architectural boundary is that **ArchiveLens is a universal ingestion pipeline** and is not coupled to or owned by any single consumer. This allows multiple specialized tools to consume the same normalized SQLite index:
 
-### 2. Understand: RootNode 🌲
-* **Role**: Synthesis, relationship mapping, and semantic querying.
-* **Capabilities**:
-  - **Hierarchical Summaries**: Dynamically roll up search contexts.
-  - **Topic Nodes**: Reconstruct topics (e.g., *QuickBooks*, *SellMedia*, *Billing*) into a knowledge graph.
-  - **Timeline Construction**: Cross-reference dates from emails, CSVs, commit logs, and notes to show how a project evolved over years.
-  - **Long-term Memory**: Maintain historical query contexts for deep semantic search.
+```
+                            Outlook PST / OST ────┐
+                            Local Directories ────┼──> ArchiveLens Ingestion
+                            Git Commits / Logs ───┘           │
+                                                              ▼
+                                                        [archive.db]
+                                                              │
+                    ┌─────────────────┬───────────────────────┼───────────────────────┐
+                    ▼                 ▼                       ▼                       ▼
+               RootNode          AI Assistant          Timeline Viewer            Search UIs
+         (Understand & Create)   (Interactive Q&A)   (Chronological Graphs)  (Keywords & Vectors)
+```
 
-### 3. Capture: DailyNotes ✍️
-* **Role**: The capture mechanism and entry point for fresh day-to-day knowledge.
-* **Workflow**:
-  1. Record notes, timings, and logs during the workday.
-  2. ArchiveLens ingests these Daily Notes.
-  3. RootNode synthesizes the new entries, relates them to existing topic nodes, and updates active project timelines.
+### Downstream Consumers
+- **RootNode**: Focuses purely on summarizing, mapping relationships, constructing semantic knowledge graphs, and creating fresh documents.
+- **AI Assistant**: Performs conversational RAG over the archive to answer quick inquiries.
+- **Timeline Viewer**: Generates chronological visual tracks of what was happening on specific projects, companies, or files over three decades.
+- **DailyNotes**: References historical contexts directly when logging new notes, closing the loop between *Capture* and *Recall*.
 
 ---
 
 ## The Ultimate Showcase
 
-By decoupling the ingestion (`ArchiveLens`) from the cognitive engine (`RootNode`), we build an architecture capable of answering high-level temporal and semantic questions, such as:
+By separating the ingestion (`ArchiveLens`) from the semantic analysis (`RootNode`), we build an architecture capable of answering high-level temporal and semantic questions, such as:
 
 > *"How did the SellMedia billing logic evolve between 2006 and 2012?"*
 
-Instead of returning a flat list of keywords, the ecosystem builds a structured timeline from:
-- **2006 MAPI emails** (extracting decisions).
+Instead of returning a flat keyword index, the ecosystem synthesizes:
+- **2006 MAPI emails** (extracting initial design decisions).
 - **SQL scripts** (documenting database schema updates).
 - **Daily Notes** (reflecting active debugging thoughts).
 - **Source Code commits** (tracking implementation details).
+
